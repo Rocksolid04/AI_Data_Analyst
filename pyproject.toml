@@ -9,13 +9,14 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "alembic>=1.20.0",
+    "asyncpg>=0.32.0",
     "fastapi>=0.147.0",
     "numpy>=2.5.4",
     "pandas>=3.0.6",
     "psycopg[binary]>=3.3.6",
     "pydantic-settings>=2.16.0",
     "python-multipart>=0.0.32",
-    "sqlalchemy>=2.1.5",
+    "sqlalchemy[asyncio]>=2.1.5",
     "uvicorn[standard]>=0.54.0",
 ]
 

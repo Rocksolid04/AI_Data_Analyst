@@ -6,6 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from fastapi.security import OAuth2PasswordRequestForm
 
+from typing import Annotated
+
+from ai_analtytics_models.dependencies import get_current_user
+
 from ai_analtytics_models.auth import create_access_token
 from ai_analtytics_models.security import verify_password
 
@@ -81,4 +85,11 @@ async def login_user(
         "access_token": access_token,
         "token_type": "bearer",
     }
+
+
+@router.get("/me", response_model=UserResponse)
+async def read_current_user(
+    current_user: Annotated[User, Depends(get_current_user)],
+):
+    return current_user
 

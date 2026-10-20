@@ -9,6 +9,7 @@ from sqlalchemy import text
 from ai_analtytics_models.config import settings
 from ai_analtytics_models.database import engine
 
+from ai_analtytics_models.routers.datasets import router as datasets_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -23,6 +24,7 @@ app = FastAPI(
 )
 
 app.include_router(users_router)
+app.include_router(datasets_router)
 
 
 @app.get("/")

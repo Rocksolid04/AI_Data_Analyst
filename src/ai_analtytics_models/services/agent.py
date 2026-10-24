@@ -1,4 +1,5 @@
 
+import json
 import logging
 import os
 
@@ -9,14 +10,11 @@ from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 
-
 from ai_analtytics_models.services.analytics_engine import (
     run_analysis,
     run_time_series_analysis,
     create_chart_spec,
 )
-
-
 from ai_analtytics_models.services.reporting import (
     format_report,
     generate_report,
@@ -29,18 +27,65 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
+def _normalize_ai_content(content: object) -> str:
+    """Convert common LLM response formats into readable text."""
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        parts = []
+
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text_value = block.get("text")
+                if isinstance(text_value, str):
+                    parts.append(text_value)
+
+        return "\n".join(parts).strip()
+
+    if content is None:
+        return ""
+
+    return str(content).strip()
+
+
+def _parse_tool_result(content: object) -> object:
+    """Parse JSON-formatted tool output while preserving other content."""
+    if isinstance(content, (dict, list)):
+        return content
+
+    text_content = _normalize_ai_content(content)
+
+    if not text_content:
+        return None
+
+    try:
+        return json.loads(text_content)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return text_content
+
+
 async def answer_dataset_question(
     dataframe: pd.DataFrame,
     question: str,
 ) -> dict:
     """Answer dataset questions using a LangGraph agent and validated tools."""
 
-    if not question.strip():
+    if not isinstance(question, str) or not question.strip():
         return {
             "question": question,
             "answer": "Please provide a question.",
             "tool_calls": [],
+            "chart": None,
         }
+
+    if not isinstance(dataframe, pd.DataFrame):
+        raise ValueError("The input must be a Pandas DataFrame.")
+
+    if dataframe.empty:
+        raise ValueError("Cannot analyze an empty dataset.")
 
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
@@ -75,6 +120,7 @@ async def answer_dataset_question(
         Args:
             operation: One of aggregate, group_by, distribution, correlation.
             column: Exact dataset column to analyze.
+            columns: Exact column names for multi-column analysis.
             aggregation: sum, mean, min, max, median, count, or std.
             filters: Optional validated filter conditions.
             combine_with: Combine filters using and or or.
@@ -135,7 +181,7 @@ async def answer_dataset_question(
             anomaly_threshold=anomaly_threshold,
             top_n=top_n,
         )
-    
+
     @tool
     def create_chart(
         chart_type: str,
@@ -172,7 +218,6 @@ async def answer_dataset_question(
             bins=bins,
             top_n=top_n,
         )
-
 
     tools = [
         inspect_dataset,
@@ -248,19 +293,40 @@ async def answer_dataset_question(
     if final_message is None:
         raise RuntimeError("The agent did not produce a final answer.")
 
+    final_answer = _normalize_ai_content(final_message.content)
+
+    if not final_answer:
+        raise RuntimeError("The agent produced an empty final answer.")
+
     tool_calls_made = []
+    chart_spec = None
 
     for message in messages:
-        if isinstance(message, ToolMessage):
-            tool_calls_made.append({
+        if not isinstance(message, ToolMessage):
+            continue
+
+        tool_calls_made.append(
+            {
                 "tool": message.name,
                 "result": message.content,
-            })
+            }
+        )
+
+        if message.name == "create_chart":
+            parsed_result = _parse_tool_result(message.content)
+
+            if isinstance(parsed_result, dict):
+                chart_spec = parsed_result
+            else:
+                logger.warning(
+                    "Chart tool output could not be parsed as a chart object."
+                )
 
     response = {
         "question": question,
-        "answer": final_message.content,
+        "answer": final_answer,
         "tool_calls": tool_calls_made,
+        "chart": chart_spec,
     }
 
     if is_report_request(question):

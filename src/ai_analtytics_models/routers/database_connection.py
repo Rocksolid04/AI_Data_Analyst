@@ -1,0 +1,243 @@
+
+import logging
+from datetime import datetime, timezone
+from typing import Annotated
+from urllib.parse import quote
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    create_async_engine,
+)
+from sqlalchemy.engine import URL
+from sqlalchemy.pool import NullPool
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ai_analtytics_models.database import get_db
+from ai_analtytics_models.dependencies import get_current_user
+from ai_analtytics_models.models.database_connection import DatabaseConnection
+from ai_analtytics_models.models.user import User
+from ai_analtytics_models.schemas.database_connection import (
+    DatabaseConnectionCreate,
+    DatabaseConnectionResponse,
+    DatabaseConnectionTestResponse,
+)
+from ai_analtytics_models.services.credential_encryption import (
+    decrypt_password,
+    encrypt_password,
+)
+
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/database-connections",
+    tags=["Database Connections"],
+)
+
+CONNECTION_TIMEOUT_SECONDS = 5
+QUERY_TIMEOUT_SECONDS = 5
+
+
+async def _get_owned_connection(
+    connection_id: int,
+    user_id: int,
+    db: AsyncSession,
+) -> DatabaseConnection:
+    """Fetch a connection only if it belongs to the current user."""
+    connection = await db.scalar(
+        select(DatabaseConnection).where(
+            DatabaseConnection.id == connection_id,
+            DatabaseConnection.user_id == user_id,
+        )
+    )
+
+    if connection is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Database connection not found.",
+        )
+
+    return connection
+
+
+def _build_external_engine(
+    connection: DatabaseConnection,
+) -> AsyncEngine:
+    """Create a short-lived engine for an external PostgreSQL database."""
+    password = decrypt_password(connection.encrypted_password)
+
+    url = URL.create(
+        drivername="postgresql+asyncpg",
+        username=connection.username,
+        password=password,
+        host=connection.host,
+        port=connection.port,
+        database=connection.database_name,
+    )
+
+    return create_async_engine(
+        url,
+        poolclass=NullPool,
+        connect_args={
+            "timeout": CONNECTION_TIMEOUT_SECONDS,
+            "command_timeout": QUERY_TIMEOUT_SECONDS,
+            "server_settings": {
+                "statement_timeout": str(QUERY_TIMEOUT_SECONDS * 1000),
+            },
+        },
+    )
+
+
+@router.post(
+    "/",
+    response_model=DatabaseConnectionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_database_connection(
+    payload: DatabaseConnectionCreate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> DatabaseConnection:
+    """Save connection details without exposing the stored password."""
+    connection = DatabaseConnection(
+        user_id=current_user.id,
+        name=payload.name,
+        database_type="postgresql",
+        host=payload.host,
+        port=payload.port,
+        database_name=payload.database_name,
+        username=payload.username,
+        encrypted_password=encrypt_password(
+            payload.password.get_secret_value()
+        ),
+        is_active=False,
+    )
+
+    try:
+        db.add(connection)
+        await db.commit()
+        await db.refresh(connection)
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        logger.exception("Could not save database connection metadata.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not save the database connection.",
+        ) from exc
+
+    return connection
+
+
+@router.get(
+    "/",
+    response_model=list[DatabaseConnectionResponse],
+)
+async def list_database_connections(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[DatabaseConnection]:
+    """List the authenticated user's saved database connections."""
+    result = await db.scalars(
+        select(DatabaseConnection)
+        .where(DatabaseConnection.user_id == current_user.id)
+        .order_by(DatabaseConnection.created_at.desc())
+    )
+
+    return list(result.all())
+
+
+@router.post(
+    "/{connection_id}/test",
+    response_model=DatabaseConnectionTestResponse,
+)
+async def test_database_connection(
+    connection_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> DatabaseConnectionTestResponse:
+    """Test external PostgreSQL connectivity with bounded timeouts."""
+    connection = await _get_owned_connection(
+        connection_id=connection_id,
+        user_id=current_user.id,
+        db=db,
+    )
+
+    tested_at = datetime.now(timezone.utc)
+    engine = None
+    success = False
+
+    try:
+        engine = _build_external_engine(connection)
+
+        async with engine.connect() as external_db:
+            result = await external_db.execute(text("SELECT 1"))
+            success = result.scalar_one() == 1
+
+    except Exception:
+        # Avoid returning credentials or low-level connection details.
+        logger.warning(
+            "External database connection test failed for connection id %s.",
+            connection.id,
+            exc_info=True,
+        )
+
+    finally:
+        if engine is not None:
+            await engine.dispose()
+
+    connection.is_active = success
+    connection.last_tested_at = tested_at
+
+    try:
+        await db.commit()
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        logger.exception("Could not persist connection test result.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not save the connection test result.",
+        ) from exc
+
+    return DatabaseConnectionTestResponse(
+        connection_id=connection.id,
+        success=success,
+        message=(
+            "Connection successful."
+            if success
+            else "Connection failed. Check the host, port, database, "
+            "credentials, network access, and PostgreSQL permissions."
+        ),
+        tested_at=tested_at,
+    )
+
+
+@router.delete(
+    "/{connection_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_database_connection(
+    connection_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> None:
+    """Delete a saved connection owned by the authenticated user."""
+    connection = await _get_owned_connection(
+        connection_id=connection_id,
+        user_id=current_user.id,
+        db=db,
+    )
+
+    try:
+        await db.delete(connection)
+        await db.commit()
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        logger.exception("Could not delete database connection.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not delete the database connection.",
+        ) from exc

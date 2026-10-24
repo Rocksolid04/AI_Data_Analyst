@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import math
 import pandas as pd
 import numpy as np
 
@@ -37,8 +38,11 @@ def _json_value(value: Any) -> Any:
         except (ValueError, TypeError):
             pass
 
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
+    if value is None or isinstance(value, (str, bool, int)):
+       return value
+
+    if isinstance(value, float):
+       return value if math.isfinite(value) else None
 
     # Convert dates and timestamps to ISO 8601 strings.
     if hasattr(value, "isoformat"):
@@ -261,6 +265,9 @@ def _apply_filters(
 
                 # Missing values should not accidentally match "ne".
                 mask = mask & series.notna()
+                # Numeric comparisons must also exclude values that failed conversion.
+                if numeric_column or numeric_value:
+                    mask = mask & comparable.notna()
 
         masks.append(mask.fillna(False).astype(bool))
 
@@ -289,7 +296,12 @@ def _aggregate(
     if aggregation == "count":
         return int(series.count())
 
-    numeric_series = pd.to_numeric(series, errors="coerce").dropna()
+    numeric_series = pd.to_numeric(
+        series,
+        errors="coerce",
+    ) 
+
+    numeric_series = numeric_series[np.isfinite(numeric_series)]
 
     if numeric_series.empty:
         return None
@@ -312,7 +324,6 @@ def run_analysis(
     top_n: int = 10,
 ) -> dict:
     """Execute a validated, deterministic dataset analysis."""
-    import numpy as np
 
     supported_operations = {
         "summary",
@@ -434,7 +445,18 @@ def run_analysis(
             "column": column,
             "aggregation": aggregation,
             "value": _json_value(value),
-            "rows_analyzed": int(filtered[column].notna().sum()),
+            "rows_analyzed": (
+                int(filtered[column].notna().sum())
+                if aggregation == "count"
+                else int(
+                    np.isfinite(
+                        pd.to_numeric(
+                            filtered[column],
+                            errors="coerce",
+                        )
+                    ).sum()
+                )
+            ),
         }
 
     # GROUP BY
@@ -773,6 +795,7 @@ def run_time_series_analysis(
         & previous.ne(0)
     )
 
+
     # Robust anomaly detection using median absolute deviation.
     anomaly_flags = pd.Series(False, index=series.index)
     anomaly_scores = pd.Series(np.nan, index=series.index)
@@ -785,14 +808,11 @@ def run_time_series_analysis(
         mad = float(deviations.median())
 
         if mad > 0:
+            # Modified z-score is robust to extreme observations.
             scores = 0.67448975 * (valid_series - median) / mad
-            anomaly_scores.loc[scores.index] = scores
-            anomaly_flags.loc[scores.index] = (
-                scores.abs() > anomaly_threshold
-            )
         else:
-            # MAD can be zero when most observations are identical.
-            # Use standard deviation as a fallback where possible.
+            # MAD can be zero when most values are identical.
+            # Fall back to standard deviation-based scores.
             standard_deviation = float(valid_series.std(ddof=0))
 
             if (
@@ -802,11 +822,18 @@ def run_time_series_analysis(
                 scores = (
                     valid_series - median
                 ) / standard_deviation
-
-                anomaly_scores.loc[scores.index] = scores
-                anomaly_flags.loc[scores.index] = (
-                    scores.abs() > anomaly_threshold
+            else:
+                scores = pd.Series(
+                    np.nan,
+                    index=valid_series.index,
                 )
+
+        finite_scores = scores[np.isfinite(scores)]
+        anomaly_scores.loc[finite_scores.index] = finite_scores
+        anomaly_flags.loc[finite_scores.index] = (
+            finite_scores.abs() > anomaly_threshold
+        )
+
 
     # Return chronological periods, including missing periods as nulls.
     periods = []
@@ -864,7 +891,6 @@ def run_time_series_analysis(
             "previous period is missing or zero."
         ),
     }
-
 
 def create_chart_spec(
     dataframe: pd.DataFrame,
@@ -928,7 +954,8 @@ def create_chart_spec(
         _validate_column(filtered, x_column)
 
         numeric_values = pd.to_numeric(
-            filtered[x_column], errors="coerce"
+            filtered[x_column],
+            errors="coerce",
         )
         numeric_values = numeric_values[np.isfinite(numeric_values)]
 
@@ -959,14 +986,16 @@ def create_chart_spec(
             "chart_type": "histogram",
             "title": f"Distribution of {x_column}",
             "x_axis": x_column,
+            "x_axis_type": "numeric",
             "y_axis": "Count",
             "points": points,
             "data_points": len(points),
             "source_rows": int(len(numeric_values)),
             "truncated": False,
+            "missing_periods_filled": False,
         }
 
-    # Other chart types require an x-axis column.
+    # BAR, LINE AND SCATTER REQUIRE AN X-AXIS COLUMN.
     if x_column is None:
         raise ValueError(f"A {chart_type} chart requires x_column.")
 
@@ -983,8 +1012,14 @@ def create_chart_spec(
         if x_column == y_column:
             raise ValueError("Scatter plot columns must be different.")
 
-        x_values = pd.to_numeric(filtered[x_column], errors="coerce")
-        y_values = pd.to_numeric(filtered[y_column], errors="coerce")
+        x_values = pd.to_numeric(
+            filtered[x_column],
+            errors="coerce",
+        )
+        y_values = pd.to_numeric(
+            filtered[y_column],
+            errors="coerce",
+        )
 
         valid = (
             x_values.notna()
@@ -1014,15 +1049,18 @@ def create_chart_spec(
             "chart_type": "scatter",
             "title": f"{y_column} vs {x_column}",
             "x_axis": x_column,
+            "x_axis_type": "numeric",
             "y_axis": y_column,
             "points": points,
             "data_points": len(points),
             "source_rows": total_points,
             "truncated": total_points > top_n,
+            "missing_periods_filled": False,
         }
 
     # BAR AND LINE
     selected_columns = [x_column]
+
     if y_column is not None:
         selected_columns.append(y_column)
 
@@ -1030,45 +1068,102 @@ def create_chart_spec(
 
     if y_column is None:
         grouped = working.groupby(
-            x_column, dropna=False, observed=True
+            x_column,
+            dropna=False,
+            observed=True,
+            sort=False,
         ).size()
         metric_label = "Count"
+
     elif aggregation == "count":
         grouped = working.groupby(
-            x_column, dropna=False, observed=True
+            x_column,
+            dropna=False,
+            observed=True,
+            sort=False,
         )[y_column].count()
         metric_label = f"Count of {y_column}"
+
     else:
         working[y_column] = pd.to_numeric(
-            working[y_column], errors="coerce"
+            working[y_column],
+            errors="coerce",
         )
 
         grouped = working.groupby(
-            x_column, dropna=False, observed=True
+            x_column,
+            dropna=False,
+            observed=True,
+            sort=False,
         )[y_column].agg(aggregation)
+
         metric_label = f"{aggregation.title()} of {y_column}"
 
-    # Remove infinite aggregate values; missing groups are not useful to plot.
-    grouped = grouped.replace([np.inf, -np.inf], np.nan).dropna()
+    # Remove infinite or missing aggregate values.
+    # Do not fabricate values for missing groups.
+    grouped = grouped.replace(
+        [np.inf, -np.inf],
+        np.nan,
+    ).dropna()
 
     if grouped.empty:
         raise ValueError("No valid chart data could be generated.")
 
     total_groups = len(grouped)
+    x_axis_type = "category"
 
     if chart_type == "bar":
-        grouped = grouped.sort_values(ascending=False).head(top_n)
+        # Bar charts prioritize the highest aggregate values.
+        grouped = grouped.sort_values(
+            ascending=False,
+        ).head(top_n)
+
     else:
-        # Sort chronologically if the x-axis represents dates.
-        parsed_dates = pd.to_datetime(grouped.index, errors="coerce")
-
-        if len(parsed_dates) and parsed_dates.notna().all():
-            grouped.index = parsed_dates
-            grouped = grouped.sort_index()
-        elif pd.api.types.is_numeric_dtype(grouped.index.dtype):
+        # LINE CHART: identify numeric or date-based x-axes.
+        if pd.api.types.is_numeric_dtype(grouped.index.dtype):
+            x_axis_type = "numeric"
             grouped = grouped.sort_index()
 
-        grouped = grouped.head(top_n)
+            # Retain the highest/latest numeric x-values.
+            if total_groups > top_n:
+                grouped = grouped.tail(top_n)
+
+        else:
+            # Only parse labels as dates when they look date-like.
+            labels_look_like_dates = all(
+                isinstance(value, (pd.Timestamp, np.datetime64))
+                or (
+                    isinstance(value, str)
+                    and any(
+                        separator in value
+                        for separator in ("-", "/", ":")
+                    )
+                )
+                for value in grouped.index
+            )
+
+            parsed_dates = pd.to_datetime(
+                grouped.index,
+                errors="coerce",
+                utc=True,
+            )
+
+            if (
+                labels_look_like_dates
+                and len(parsed_dates) > 0
+                and parsed_dates.notna().all()
+            ):
+                x_axis_type = "date"
+                grouped.index = parsed_dates
+                grouped = grouped.sort_index()
+
+                # Keep the newest periods in chronological order.
+                if total_groups > top_n:
+                    grouped = grouped.tail(top_n)
+
+            else:
+                # Preserve first-seen order for categorical labels.
+                grouped = grouped.head(top_n)
 
     points = [
         {
@@ -1086,10 +1181,12 @@ def create_chart_spec(
             else f"{metric_label} over {x_column}"
         ),
         "x_axis": x_column,
+        "x_axis_type": x_axis_type,
         "y_axis": metric_label,
         "aggregation": aggregation if y_column else "count",
         "points": points,
         "data_points": len(points),
         "source_groups": total_groups,
         "truncated": total_groups > top_n,
+        "missing_periods_filled": False,
     }

@@ -45,7 +45,8 @@ class AnalyticalReport(BaseModel):
     )
 
 
-REPORT_KEYWORDS = {
+
+REPORT_KEYWORDS = (
     "report",
     "executive summary",
     "management summary",
@@ -53,13 +54,22 @@ REPORT_KEYWORDS = {
     "comprehensive analysis",
     "business insights",
     "business report",
-}
+    "performance review",
+    "quarterly review",
+    "monthly review",
+    "board-ready",
+    "board report",
+    "formal analysis",
+)
 
 
 def is_report_request(question: str) -> bool:
-    """Determine whether a question explicitly requests a formal report."""
-    normalized = question.casefold()
-    return any(keyword in normalized for keyword in REPORT_KEYWORDS)
+    """Detect explicit requests for a formal analytical report."""
+    if not isinstance(question, str):
+        return False
+
+    normalized = " ".join(question.casefold().split())
+    return any(phrase in normalized for phrase in REPORT_KEYWORDS)
 
 
 def format_report(report: AnalyticalReport) -> str:
@@ -128,9 +138,19 @@ def _prepare_evidence(
     tool_results: list[dict[str, Any]],
     max_results: int = 8,
     max_chars_per_result: int = 4000,
+    max_total_chars: int = 16000,
 ) -> str:
-    """Bound evidence size while preserving valid JSON."""
+    """Prepare bounded analytical evidence for report generation."""
+    if not isinstance(tool_results, list):
+        raise ValueError("Tool results must be a list.")
+
+    if not tool_results:
+        raise ValueError(
+            "No analytical tool results are available for the report."
+        )
+
     prepared = []
+    remaining_chars = max_total_chars
 
     for item in tool_results[:max_results]:
         if not isinstance(item, dict):
@@ -138,23 +158,51 @@ def _prepare_evidence(
 
         result = item.get("result", "")
 
-        if not isinstance(result, (str, int, float, bool, type(None), dict, list)):
+        if not isinstance(
+            result,
+            (str, int, float, bool, type(None), dict, list),
+        ):
             result = str(result)
 
-        # ToolMessage content is often a JSON string. Keep it as text,
-        # but limit its size so one result cannot dominate the prompt.
-        if isinstance(result, str) and len(result) > max_chars_per_result:
-            result = (
-                result[:max_chars_per_result]
-                + "\n[Result truncated for report generation.]"
+        if isinstance(result, str):
+            result = result[:max_chars_per_result]
+
+        entry = {
+            "tool": str(item.get("tool", "unknown")),
+            "result": result,
+        }
+
+        serialized = json.dumps(
+            entry,
+            ensure_ascii=False,
+            default=str,
+        )
+
+        if len(serialized) > remaining_chars:
+            if remaining_chars <= 0:
+                break
+
+            # Preserve valid JSON while reducing this entry's result.
+            entry["result"] = (
+                serialized[:0]  # replaced below
+                if False
+                else str(result)[: max(0, remaining_chars // 2)]
             )
 
-        prepared.append(
-            {
-                "tool": str(item.get("tool", "unknown")),
-                "result": result,
-            }
-        )
+            serialized = json.dumps(
+                entry,
+                ensure_ascii=False,
+                default=str,
+            )
+
+            if len(serialized) > remaining_chars:
+                break
+
+        prepared.append(entry)
+        remaining_chars -= len(serialized)
+
+        if remaining_chars <= 0:
+            break
 
     if not prepared:
         raise ValueError(
@@ -211,7 +259,7 @@ async def generate_report(
 
     report = await structured_model.ainvoke(messages)
 
-    if not isinstance(report, AnalyticalReport):
-        report = AnalyticalReport.model_validate(report)
+    if isinstance(report, AnalyticalReport):
+        return report
 
-    return report
+    return AnalyticalReport.model_validate(report)

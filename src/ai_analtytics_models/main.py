@@ -11,6 +11,10 @@ from ai_analtytics_models.database import engine
 
 from ai_analtytics_models.routers.datasets import router as datasets_router
 
+from ai_analtytics_models.routers.database_connection import (
+    router as database_connections_router,
+)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
@@ -25,6 +29,7 @@ app = FastAPI(
 
 app.include_router(users_router)
 app.include_router(datasets_router)
+app.include_router(database_connections_router)
 
 
 @app.get("/")

@@ -53,3 +53,16 @@ class DatabaseConnectionTestResponse(BaseModel):
 
 class DatabaseQueryRequest(BaseModel):
     query: str = Field(min_length=1, max_length=20_000)
+
+
+
+class DatabaseSQLExportRequest(BaseModel):
+    sql_query: str = Field(min_length=1, max_length=20_000)
+
+    @field_validator("sql_query")
+    @classmethod
+    def validate_sql_query(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("SQL query cannot be empty.")
+        return value

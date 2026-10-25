@@ -45,19 +45,19 @@ def validate_read_only_query(query: str) -> str:
     return without_trailing_semicolon
 
 
+
 async def execute_read_only_query(
     engine: AsyncEngine,
     query: str,
 ) -> dict[str, Any]:
-    """Execute a validated query with a row cap and statement timeout."""
+    """Execute one validated read-only query and return bounded results."""
     safe_query = validate_read_only_query(query)
 
-    # Bound the execution time for this transaction.
     async with engine.connect() as connection:
         async with connection.begin():
-            await connection.execute(
-                text("SET LOCAL statement_timeout = :timeout"),
-                {"timeout": QUERY_TIMEOUT_MS},
+            await connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+            await connection.exec_driver_sql(
+                f"SET LOCAL statement_timeout = '{QUERY_TIMEOUT_MS}ms'"
             )
 
             result = await connection.execute(text(safe_query))
@@ -72,4 +72,10 @@ async def execute_read_only_query(
                 "rows": [dict(row) for row in rows],
                 "row_count": len(rows),
                 "truncated": truncated,
+                "max_rows": MAX_ROWS,
+                "summary": {
+                    "returned_rows": len(rows),
+                    "returned_columns": len(columns),
+                    "truncated": truncated,
+                },
             }

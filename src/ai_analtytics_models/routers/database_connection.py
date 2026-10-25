@@ -16,6 +16,11 @@ from sqlalchemy.pool import NullPool
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ai_analtytics_models.services.database_query import (
+    execute_read_only_query,
+)
+
+
 from ai_analtytics_models.database import get_db
 from ai_analtytics_models.dependencies import get_current_user
 from ai_analtytics_models.models.database_connection import DatabaseConnection
@@ -24,11 +29,15 @@ from ai_analtytics_models.schemas.database_connection import (
     DatabaseConnectionCreate,
     DatabaseConnectionResponse,
     DatabaseConnectionTestResponse,
+    DatabaseQueryRequest,
 )
-from ai_analtytics_models.services.credential_encryption import (
+from ai_analtytics_models.services.credentials_encryption import (
     decrypt_password,
     encrypt_password,
 )
+
+from ai_analtytics_models.services.database_inspector import inspect_database
+
 
 
 logger = logging.getLogger(__name__)
@@ -241,3 +250,103 @@ async def delete_database_connection(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not delete the database connection.",
         ) from exc
+
+
+@router.get("/{connection_id}/schema")
+async def get_database_schema(
+    connection_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    connection = await _get_owned_connection(
+        connection_id=connection_id,
+        user_id=current_user.id,
+        db=db,
+    )
+
+    engine = None
+
+    try:
+        engine = _build_external_engine(connection)
+        schema = await inspect_database(engine)
+
+        return {
+            "connection_id": connection.id,
+            "connection_name": connection.name,
+            **schema,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        logger.exception(
+            "Failed to inspect database connection ID %s",
+            connection.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                "Could not inspect the connected database. "
+                "Check the connection and database permissions."
+            ),
+        ) from None
+
+    finally:
+        if engine is not None:
+            await engine.dispose()
+            
+
+@router.post("/{connection_id}/query")
+async def query_connected_database(
+    connection_id: int,
+    payload: DatabaseQueryRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    connection = await _get_owned_connection(
+        connection_id=connection_id,
+        user_id=current_user.id,
+        db=db,
+    )
+
+    engine = None
+
+    try:
+        engine = _build_external_engine(connection)
+
+        result = await execute_read_only_query(
+            engine=engine,
+            query=payload.query,
+        )
+
+        return {
+            "connection_id": connection.id,
+            "connection_name": connection.name,
+            **result,
+        }
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from None
+
+    except Exception:
+        logger.exception(
+            "Query failed for database connection ID %s",
+            connection.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                "The query could not be completed. "
+                "Check the SQL and database permissions."
+            ),
+        ) from None
+
+    finally:
+        if engine is not None:
+            await engine.dispose()
+
+

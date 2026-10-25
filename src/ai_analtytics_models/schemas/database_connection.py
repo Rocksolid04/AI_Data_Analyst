@@ -49,3 +49,7 @@ class DatabaseConnectionTestResponse(BaseModel):
     success: bool
     message: str
     tested_at: datetime
+
+
+class DatabaseQueryRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=20_000)

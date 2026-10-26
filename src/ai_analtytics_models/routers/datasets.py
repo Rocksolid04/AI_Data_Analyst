@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import pandas as pd
+
+from fastapi.responses import Response
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -16,10 +18,19 @@ from ai_analtytics_models.database import get_db
 from ai_analtytics_models.dependencies import get_current_user
 from ai_analtytics_models.models.dataset import Dataset
 from ai_analtytics_models.models.user import User
+
 from ai_analtytics_models.schemas.dataset import DatasetResponse
+
+from ai_analtytics_models.services.dataset_profiling import (
+    profile_dataframe,
+)
+
 from ai_analtytics_models.services.agent import answer_dataset_question
 from ai_analtytics_models.services.analytics import load_dataset
-
+from ai_analtytics_models.services.dataset_export import (
+    export_dataframe_to_csv,
+    export_dataframe_to_excel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -252,68 +263,42 @@ async def preview_dataset(
 
 
 @router.get("/{dataset_id}/profile")
-async def profile_dataset(
+async def get_dataset_profile(
     dataset_id: int,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> dict[str, Any]:
-    """Return dataset dimensions, column profiles, and numeric statistics."""
+):
+    """Return a statistical profile for an owned uploaded dataset."""
     dataset = await _get_owned_dataset(
         dataset_id=dataset_id,
         user_id=current_user.id,
         db=db,
     )
 
-    file_path = _get_dataset_path(dataset.stored_filename)
-
-    if not file_path.is_file():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Dataset file not found on disk.",
-        )
+    dataset_path = _get_dataset_path(dataset)
 
     try:
         dataframe = load_dataset(
-            file_path=file_path,
+            file_path=dataset_path,
             file_type=dataset.file_type,
         )
-    except Exception as exc:
-        logger.exception("Could not load dataset for profiling.")
+        return profile_dataframe(dataframe)
+
+    except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Could not read the dataset.",
+            detail=str(exc),
         ) from exc
 
-    numeric_columns = dataframe.select_dtypes(
-        include="number"
-    ).columns
-
-    numeric_summary = {}
-
-    if len(numeric_columns) > 0:
-        summary = dataframe[numeric_columns].describe()
-        numeric_summary = json.loads(summary.to_json())
-
-    column_profiles = []
-
-    for column in dataframe.columns:
-        column_profiles.append(
-            {
-                "column": str(column),
-                "data_type": str(dataframe[column].dtype),
-                "missing_values": int(dataframe[column].isna().sum()),
-                "unique_values": int(dataframe[column].nunique()),
-            }
+    except Exception as exc:
+        logger.exception(
+            "Dataset profiling failed for dataset_id=%s",
+            dataset_id,
         )
-
-    return {
-        "dataset_id": dataset.id,
-        "filename": dataset.original_filename,
-        "total_rows": len(dataframe),
-        "total_columns": len(dataframe.columns),
-        "columns": column_profiles,
-        "numeric_summary": numeric_summary,
-    }
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not profile the requested dataset.",
+        ) from exc
 
 
 @router.post("/{dataset_id}/ask")
@@ -422,3 +407,109 @@ async def ask_dataset_question(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="The AI analysis request failed. Please try again.",
         ) from exc
+        
+
+@router.get("/{dataset_id}/export/csv")
+async def export_dataset_csv(
+    dataset_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Export an owned uploaded dataset as a CSV download."""
+    dataset = await _get_owned_dataset(
+        dataset_id=dataset_id,
+        user_id=current_user.id,
+        db=db,
+    )
+
+    dataset_path = _get_dataset_path(dataset)
+
+    try:
+        dataframe = load_dataset(
+            file_path=dataset_path,
+            file_type=dataset.file_type,
+        )
+
+        export_result = export_dataframe_to_csv(dataframe)
+
+        filename = f"dataset_{dataset.id}_export.csv"
+
+        return Response(
+            content=export_result["csv_content"],
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Export-Row-Count": str(export_result["row_count"]),
+                "X-Export-Column-Count": str(export_result["column_count"]),
+            },
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    except Exception as exc:
+        logger.exception(
+            "Dataset CSV export failed for dataset_id=%s",
+            dataset_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not export the requested dataset.",
+        ) from exc
+        
+
+@router.get("/{dataset_id}/export/excel")
+async def export_dataset_excel(
+    dataset_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Export an owned uploaded dataset as an Excel download."""
+    dataset = await _get_owned_dataset(
+        dataset_id=dataset_id,
+        user_id=current_user.id,
+        db=db,
+    )
+
+    dataset_path = _get_dataset_path(dataset)
+
+    try:
+        dataframe = load_dataset(
+            file_path=dataset_path,
+            file_type=dataset.file_type,
+        )
+
+        export_result = export_dataframe_to_excel(dataframe)
+
+        filename = f"dataset_{dataset.id}_export.xlsx"
+
+        return Response(
+            content=export_result["file_content"],
+            media_type=export_result["media_type"],
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Export-Row-Count": str(export_result["row_count"]),
+                "X-Export-Column-Count": str(export_result["column_count"]),
+            },
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    except Exception as exc:
+        logger.exception(
+            "Dataset Excel export failed for dataset_id=%s",
+            dataset_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not export the requested dataset.",
+        ) from exc
+
+
